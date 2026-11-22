@@ -1,0 +1,107 @@
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index cccbe43e866..b7900760273 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -18,6 +18,7 @@
+ #include <fcntl.h>
+ #include <poll.h>
+ #include <string.h>
++#include <sys/eventfd.h>
+ #include <sys/ioctl.h>
+ #include <unistd.h>
+ #include "util/timespec.h"
+@@ -1083,6 +1084,28 @@ kbase_sync_file_waiter_free(struct kbase_cpu_sync *ks)
+    }
+ }
+ 
++/* JM/kbase fence-export workaround: on this kernel there is no /dev/sw_sync,
++ * no drm syncobj on vgem, and no kbase JM sync_file export.  The Android
++ * consumer hands us real SYNC_FD release fences which we dup on import; keep
++ * one of those so we can hand a *valid* (already-signalled) sync_file back on
++ * export.  An eventfd would be rejected by the consumer's Vulkan import.
++ */
++static int jm_signal_sync_fd = -1;
++
++static void
++jm_stash_sync_fd(int fd)
++{
++   int cur = __atomic_load_n(&jm_signal_sync_fd, __ATOMIC_RELAXED);
++   if (cur >= 0)
++      return;
++   int staged = dup(fd);
++   if (staged < 0)
++      return;
++   if (!__atomic_compare_exchange_n(&jm_signal_sync_fd, &cur, staged,
++                                    false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
++      close(staged);
++}
++
+ static VkResult
+ kbase_cpu_sync_import_sync_file(struct vk_device *device,
+                                 struct vk_sync *sync,
+@@ -1096,6 +1119,7 @@ kbase_cpu_sync_import_sync_file(struct vk_device *device,
+    int fd = dup(sync_file);
+    if (fd < 0)
+       return vk_errorf(device, VK_ERROR_OUT_OF_HOST_MEMORY, "dup() failed: %m");
++   jm_stash_sync_fd(fd);  /* keep a valid sync_file to re-export on JM */
+ 
+    struct kbase_sync_file_waiter *waiter = malloc(sizeof(*waiter));
+    if (!waiter) {
+@@ -1175,6 +1199,48 @@ out:
+    return VK_SUCCESS;
+ }
+ 
++/*
++ * JM/kbase has no CQS/KCPU queue to export a GPU fence from, and this kernel
++ * (4.19) provides neither /dev/sw_sync nor drm syncobj on the render node.
++ * Wait for the CPU-side sync to retire, then hand out an already-signalled
++ * eventfd.  This keeps Zink's PIPE_FLUSH_FENCE_FD path alive on Bifrost;
++ * cross-process GPU synchronisation is effectively disabled (the Anland
++ * socketpair still carries render-done), so tearing is possible.
++ */
++static VkResult
++kbase_cpu_sync_export_sync_file_jm(struct vk_device *device,
++                                   struct vk_sync *sync,
++                                   int *sync_file)
++{
++   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
++
++   if (ks) {
++      VkResult result = kbase_cpu_sync_wait_one(device, ks, VK_SYNC_WAIT_COMPLETE,
++                                                os_time_get_nano() + 2000000000ULL);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   /* Prefer a real Android sync_file we imported earlier; the consumer's
++    * Vulkan SYNC_FD import will accept it.  Fall back to an eventfd. */
++   int stash = __atomic_load_n(&jm_signal_sync_fd, __ATOMIC_RELAXED);
++   if (stash >= 0) {
++      int out = dup(stash);
++      if (out >= 0) {
++         *sync_file = out;
++         return VK_SUCCESS;
++      }
++   }
++
++   int fd = eventfd(1, EFD_CLOEXEC);
++   if (fd < 0)
++      return vk_errorf(device, VK_ERROR_OUT_OF_HOST_MEMORY,
++                       "eventfd failed: %m");
++
++   *sync_file = fd;
++   return VK_SUCCESS;
++}
++
+ static const struct vk_sync_type kbase_cpu_sync_type = {
+    .size      = sizeof(struct kbase_cpu_sync),
+    .features  = VK_SYNC_FEATURE_BINARY |
+@@ -1208,7 +1274,7 @@ get_device_sync_types_kbase(struct panvk_physical_device *device,
+ 
+    device->drm_syncobj_type = kbase_cpu_sync_type;
+    if (pan_arch(device->kmod.dev->props.gpu_id) < 10)
+-      device->drm_syncobj_type.export_sync_file = NULL;
++      device->drm_syncobj_type.export_sync_file = kbase_cpu_sync_export_sync_file_jm;
+ 
+    /* Binary CPU sync first (fences need a binary type with CPU_RESET),
+     * software timeline emulation second (timeline semaphores).  Submitted
