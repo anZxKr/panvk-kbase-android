@@ -1,0 +1,165 @@
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index b7900760273..1b967ed9bc1 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -51,6 +51,30 @@
+ #include "pan_compiler.h"
+ #include "pan_props.h"
+ 
++#if defined(HAVE_PAN_KMOD_KBASE)
++#define DRM_VGEM_FENCE_EXPORT_SYNC_FILE 0x3
++#define DRM_VGEM_FENCE_SIGNAL 0x2
++
++struct drm_vgem_fence_export_sync_file {
++   uint32_t flags;
++   uint32_t out_fence;
++   int32_t fd;
++   uint32_t pad;
++};
++
++struct drm_vgem_fence_signal {
++   uint32_t fence;
++   uint32_t flags;
++};
++
++#define DRM_IOCTL_VGEM_FENCE_EXPORT_SYNC_FILE                                   \
++   DRM_IOWR(DRM_COMMAND_BASE + DRM_VGEM_FENCE_EXPORT_SYNC_FILE,                 \
++            struct drm_vgem_fence_export_sync_file)
++#define DRM_IOCTL_VGEM_FENCE_SIGNAL                                             \
++   DRM_IOW(DRM_COMMAND_BASE + DRM_VGEM_FENCE_SIGNAL,                            \
++           struct drm_vgem_fence_signal)
++#endif
++
+ #include "genxml/gen_macros.h"
+ 
+ #define PER_ARCH_FUNCS(_ver)                                                   \
+@@ -1241,6 +1265,120 @@ kbase_cpu_sync_export_sync_file_jm(struct vk_device *device,
+    return VK_SUCCESS;
+ }
+ 
++struct jm_vgem_signal_job {
++   int drm_fd;
++   uint32_t fence;
++   panvk_kbase_sync_wait_func wait;
++   void *data;
++   uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT];
++   uint64_t timeout_ns;
++};
++
++static void
++jm_vgem_signal_now(int drm_fd, uint32_t fence)
++{
++   struct drm_vgem_fence_signal arg = {
++      .fence = fence,
++   };
++   drmIoctl(drm_fd, DRM_IOCTL_VGEM_FENCE_SIGNAL, &arg);
++}
++
++static int
++jm_vgem_signal_thread(void *arg)
++{
++   struct jm_vgem_signal_job *job = arg;
++
++   if (job->wait)
++      job->wait(job->data, job->targets, job->timeout_ns);
++
++   jm_vgem_signal_now(job->drm_fd, job->fence);
++
++   if (job->data && job->wait == kbase_sync_file_wait_func) {
++      struct kbase_sync_file_waiter *waiter = job->data;
++      if (waiter->fd >= 0)
++         close(waiter->fd);
++      free(waiter);
++   }
++
++   close(job->drm_fd);
++   free(job);
++   return 0;
++}
++
++static VkResult
++kbase_cpu_sync_export_sync_file_jm_vgem(struct vk_device *device,
++                                        struct vk_sync *sync,
++                                        int *sync_file)
++{
++   const char *enabled = os_get_option("PANVK_KBASE_JM_VGEM_FENCE");
++   if (!enabled || enabled[0] != '1')
++      return kbase_cpu_sync_export_sync_file_jm(device, sync, sync_file);
++
++   const char *node = os_get_option("PANVK_KBASE_DRM_NODE");
++   if (!node || !node[0] || !strcmp(node, "0"))
++      node = "/dev/dri/renderD128";
++
++   int vgem_fd = open(node, O_RDWR | O_CLOEXEC | O_NOCTTY);
++   if (vgem_fd < 0)
++      return kbase_cpu_sync_export_sync_file_jm(device, sync, sync_file);
++
++   struct drm_vgem_fence_export_sync_file export = {0};
++   if (drmIoctl(vgem_fd, DRM_IOCTL_VGEM_FENCE_EXPORT_SYNC_FILE, &export) < 0 ||
++       export.fd < 0) {
++      close(vgem_fd);
++      return kbase_cpu_sync_export_sync_file_jm(device, sync, sync_file);
++   }
++
++   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
++   struct jm_vgem_signal_job *job = calloc(1, sizeof(*job));
++   if (!job) {
++      jm_vgem_signal_now(vgem_fd, export.out_fence);
++      close(export.fd);
++      close(vgem_fd);
++      return kbase_cpu_sync_export_sync_file_jm(device, sync, sync_file);
++   }
++
++   job->drm_fd = vgem_fd;
++   job->fence = export.out_fence;
++   job->timeout_ns = os_time_get_nano() + 25000000000ULL;
++
++   mtx_lock(&ks->mutex);
++   if (ks->state != KBASE_CPU_SYNC_SIGNALED) {
++      job->wait = ks->pending_wait;
++      job->data = ks->pending_data;
++      memcpy(job->targets, ks->targets, sizeof(job->targets));
++   }
++   mtx_unlock(&ks->mutex);
++
++   if (job->wait == kbase_sync_file_wait_func && job->data) {
++      struct kbase_sync_file_waiter *src = job->data;
++      struct kbase_sync_file_waiter *copy = malloc(sizeof(*copy));
++      if (!copy || src->fd < 0 || (copy->fd = dup(src->fd)) < 0) {
++         free(copy);
++         job->wait = NULL;
++         job->data = NULL;
++      } else {
++         job->data = copy;
++      }
++   }
++
++   if (job->wait) {
++      thrd_t thread;
++      if (thrd_create(&thread, jm_vgem_signal_thread, job) != thrd_success) {
++         job->wait = NULL;
++         jm_vgem_signal_thread(job);
++         close(export.fd);
++         return kbase_cpu_sync_export_sync_file_jm(device, sync, sync_file);
++      }
++      thrd_detach(thread);
++   } else {
++      jm_vgem_signal_thread(job);
++   }
++
++   *sync_file = export.fd;
++   return VK_SUCCESS;
++}
++
+ static const struct vk_sync_type kbase_cpu_sync_type = {
+    .size      = sizeof(struct kbase_cpu_sync),
+    .features  = VK_SYNC_FEATURE_BINARY |
+@@ -1274,7 +1412,7 @@ get_device_sync_types_kbase(struct panvk_physical_device *device,
+ 
+    device->drm_syncobj_type = kbase_cpu_sync_type;
+    if (pan_arch(device->kmod.dev->props.gpu_id) < 10)
+-      device->drm_syncobj_type.export_sync_file = kbase_cpu_sync_export_sync_file_jm;
++      device->drm_syncobj_type.export_sync_file = kbase_cpu_sync_export_sync_file_jm_vgem;
+ 
+    /* Binary CPU sync first (fences need a binary type with CPU_RESET),
+     * software timeline emulation second (timeline semaphores).  Submitted

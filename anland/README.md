@@ -1,7 +1,7 @@
 # Mali-G52 / Anland PanVK ICD (branch `mali-g52`)
 
 This branch is NEURAX-FX `main` (which has merged `debug/wayland-shm-readback`)
-plus one local patch for Samsung Galaxy A13 / Mali-G52 (Bifrost JM, arch v7).
+plus two local patches for Samsung Galaxy A13 / Mali-G52 (Bifrost JM, arch v7).
 
 ## What is local to this branch
 
@@ -12,9 +12,14 @@ plus one local patch for Samsung Galaxy A13 / Mali-G52 (Bifrost JM, arch v7).
   back to a signalled eventfd. Cross-process GPU sync is effectively disabled;
   the Anland socketpair carries render-done. The Anland consumer tolerates this
   because niri is built to submit GPU-staging frames with `fd = -1`.
+- `anland/0002-panvk-jm-vgem-sync-file.patch` — env-gated vgem `sync_file`
+  bridge for JM. Requires `anZxKr/SM-A135F_Kernel@77be591ee`. With
+  `PANVK_KBASE_JM_VGEM_FENCE=1`, export returns a pending vgem fd immediately
+  and signals it after kbase/JM completion. Default/off keeps the 0001 path.
 - `anland/linux-aarch64-cross.ini` — AArch64 glibc cross file (system cross
   toolchain; no NEURAX sysroot needed).
 - `anland/build-g52.sh` — reproducible build driver.
+- `anland/build-g52-vgem-fence.sh` — reproducible build for the vgem test ICD.
 
 `muic/0003` is deliberately NOT applied: it is CSF/G720-only (KCPU queues,
 `CQS_SET_OPERATION`, `FENCE_WAIT`) and does not apply to JM.
@@ -35,22 +40,42 @@ Host tools (`mesa_clc`, `panfrost_compile`, `vtn_bindgen2`) are needed for
 ```sh
 chmod +x anland/build-g52.sh
 PANVK_JOBS=2 ./anland/build-g52.sh
+
+chmod +x anland/build-g52-vgem-fence.sh
+PANVK_JOBS=2 ./anland/build-g52-vgem-fence.sh
 ```
 
-Output: `artifacts/panvk-g52-anland/libvulkan_panfrost.so` + `panvk-g52.json`.
+Outputs:
+
+```text
+artifacts/panvk-g52-anland/libvulkan_panfrost.so
+artifacts/panvk-g52-vgem-fence/libvulkan_panfrost.so
+```
 
 ## Device install (container, Fedora 45 aarch64)
+
+For the current ICD:
 
 ```sh
 install -Dm755 libvulkan_panfrost.so /opt/panvk-anland/libvulkan_panfrost.so
 install -Dm644 panvk-g52.json /opt/panvk-anland/panvk-g52.json
 ```
 
-niri env (already in use):
+For the vgem ICD:
+
+```sh
+install -Dm755 libvulkan_panfrost.so /opt/panvk-anland-vgem/libvulkan_panfrost.so
+install -Dm644 panvk-g52.json /opt/panvk-anland-vgem/panvk-g52.json
+```
+
+niri env for the vgem ICD:
 
 ```
-ANLAND_PANVK_ICD=/opt/panvk-anland/libvulkan_panfrost.so
-VK_DRIVER_FILES=/opt/panvk-anland/panvk-g52.json
+ANLAND_PANVK_ICD=/opt/panvk-anland-vgem/libvulkan_panfrost.so
+VK_DRIVER_FILES=/opt/panvk-anland-vgem/panvk-g52.json
 PANVK_KBASE_DRM_NODE=/dev/dri/renderD128
 PANVK_KBASE_ANLAND_STAGING=1
+PANVK_KBASE_JM_VGEM_FENCE=1
 ```
+
+The rebuilt `vgem.ko` must be loaded manually after boot.
