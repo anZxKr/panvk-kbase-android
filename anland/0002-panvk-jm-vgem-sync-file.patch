@@ -1,5 +1,68 @@
+diff --git a/src/panfrost/vulkan/panvk_device.h b/src/panfrost/vulkan/panvk_device.h
+index 0801fa869b5..60ff98eabe2 100644
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -6,8 +6,11 @@
+ #ifndef PANVK_DEVICE_H
+ #define PANVK_DEVICE_H
+ 
++#include <stdbool.h>
+ #include <stdint.h>
+ 
++#include "util/u_thread.h"
++
+ #include "vk_debug_utils.h"
+ #include "vk_device.h"
+ #include "vk_meta.h"
+@@ -35,6 +38,24 @@
+ 
+ struct panvk_image;
+ 
++#if defined(HAVE_PAN_KMOD_KBASE)
++#define PANVK_JM_VGEM_WORKER_QUEUE_SIZE 64
++
++struct jm_vgem_signal_job {
++   struct panvk_device *dev;
++   uint32_t fence;
++   panvk_kbase_sync_wait_func wait;
++   void *data;
++   uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT];
++   uint64_t timeout_ns;
++   int wait_fd;
++   bool has_wait_fd;
++};
++
++void panvk_jm_vgem_worker_init(struct panvk_device *dev);
++void panvk_jm_vgem_worker_finish(struct panvk_device *dev);
++#endif
++
+ /* On JM hardware, we need to allocate a buffer depending on vertex count.
+  *
+  * As a result, for indirect and indexed draw we allocate a large buffer with
+@@ -74,6 +95,21 @@ struct panvk_device {
+       struct pan_kmod_allocator allocator;
+    } kmod;
+ 
++#if defined(HAVE_PAN_KMOD_KBASE)
++   struct {
++      int vgem_fd;
++      thrd_t thread;
++      mtx_t mutex;
++      cnd_t cond;
++      bool started;
++      bool stopping;
++      uint32_t head;
++      uint32_t tail;
++      uint32_t queued;
++      struct jm_vgem_signal_job jobs[PANVK_JM_VGEM_WORKER_QUEUE_SIZE];
++   } jm_vgem;
++#endif
++
+    struct panvk_priv_bo *tiler_heap;
+    /* v9: second heap for the odd passes of PANVK_OVERLAP (v67b), so each
+     * heap grows from its own base (kbase commits up to the faulting page). */
 diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
-index b7900760273..1b967ed9bc1 100644
+index b7900760273..ab18eca1769 100644
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
 @@ -51,6 +51,30 @@
@@ -33,48 +96,174 @@ index b7900760273..1b967ed9bc1 100644
  #include "genxml/gen_macros.h"
  
  #define PER_ARCH_FUNCS(_ver)                                                   \
-@@ -1241,6 +1265,120 @@ kbase_cpu_sync_export_sync_file_jm(struct vk_device *device,
+@@ -1241,6 +1265,240 @@ kbase_cpu_sync_export_sync_file_jm(struct vk_device *device,
     return VK_SUCCESS;
  }
  
-+struct jm_vgem_signal_job {
-+   int drm_fd;
-+   uint32_t fence;
-+   panvk_kbase_sync_wait_func wait;
-+   void *data;
-+   uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT];
-+   uint64_t timeout_ns;
-+};
-+
 +static void
 +jm_vgem_signal_now(int drm_fd, uint32_t fence)
 +{
 +   struct drm_vgem_fence_signal arg = {
 +      .fence = fence,
 +   };
-+   drmIoctl(drm_fd, DRM_IOCTL_VGEM_FENCE_SIGNAL, &arg);
++   if (drmIoctl(drm_fd, DRM_IOCTL_VGEM_FENCE_SIGNAL, &arg) < 0)
++      mesa_logw("vgem fence signal failed: %s", strerror(errno));
++}
++
++static const char *
++jm_vgem_node(void)
++{
++   const char *node = os_get_option("PANVK_KBASE_DRM_NODE");
++   return node && node[0] && strcmp(node, "0") ? node : "/dev/dri/renderD128";
++}
++
++static bool
++jm_vgem_is_render_node(int fd)
++{
++   struct stat st;
++   char name[sizeof("vgem") - 1];
++   struct drm_version version = {
++      .name_len = sizeof(name),
++      .name = name,
++   };
++
++   return fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) &&
++          drmGetNodeTypeFromFd(fd) == DRM_NODE_RENDER &&
++          drmIoctl(fd, DRM_IOCTL_VERSION, &version) == 0 &&
++          version.name_len == sizeof(name) &&
++          !memcmp(name, "vgem", sizeof(name));
++}
++
++static VkResult
++jm_vgem_fd_wait_func(void *data, UNUSED const uint64_t *targets,
++                     uint64_t abs_timeout_ns)
++{
++   int fd = *(int *)data;
++   struct kbase_sync_file_waiter waiter = {
++      .fd = fd,
++   };
++   return kbase_sync_file_wait_func(&waiter, targets, abs_timeout_ns);
++}
++
++static void
++jm_vgem_job_finish(struct jm_vgem_signal_job *job)
++{
++   if (job->has_wait_fd && job->wait_fd >= 0)
++      close(job->wait_fd);
++   memset(job, 0, sizeof(*job));
++}
++
++static void
++jm_vgem_run_job(struct panvk_device *dev, struct jm_vgem_signal_job *job)
++{
++   VkResult result = VK_SUCCESS;
++
++   if (job->has_wait_fd)
++      job->data = &job->wait_fd;
++
++   if (job->wait)
++      result = job->wait(job->data, job->targets, job->timeout_ns);
++
++   if (result == VK_TIMEOUT)
++      vk_device_set_lost(&dev->vk, "vgem fence wait timed out");
++   else if (result != VK_SUCCESS)
++      vk_device_set_lost(&dev->vk, "vgem fence wait failed: %d", (int)result);
++
++   jm_vgem_signal_now(dev->jm_vgem.vgem_fd, job->fence);
++   jm_vgem_job_finish(job);
 +}
 +
 +static int
-+jm_vgem_signal_thread(void *arg)
++jm_vgem_worker_thread(void *arg)
 +{
-+   struct jm_vgem_signal_job *job = arg;
++   struct panvk_device *dev = arg;
 +
-+   if (job->wait)
-+      job->wait(job->data, job->targets, job->timeout_ns);
++   mtx_lock(&dev->jm_vgem.mutex);
++   while (!dev->jm_vgem.stopping || dev->jm_vgem.queued) {
++      if (!dev->jm_vgem.queued) {
++         cnd_wait(&dev->jm_vgem.cond, &dev->jm_vgem.mutex);
++         continue;
++      }
 +
-+   jm_vgem_signal_now(job->drm_fd, job->fence);
++      struct jm_vgem_signal_job job =
++         dev->jm_vgem.jobs[dev->jm_vgem.head];
++      dev->jm_vgem.head =
++         (dev->jm_vgem.head + 1) % PANVK_JM_VGEM_WORKER_QUEUE_SIZE;
++      dev->jm_vgem.queued--;
++      mtx_unlock(&dev->jm_vgem.mutex);
 +
-+   if (job->data && job->wait == kbase_sync_file_wait_func) {
-+      struct kbase_sync_file_waiter *waiter = job->data;
-+      if (waiter->fd >= 0)
-+         close(waiter->fd);
-+      free(waiter);
++      jm_vgem_run_job(dev, &job);
++
++      mtx_lock(&dev->jm_vgem.mutex);
++   }
++   mtx_unlock(&dev->jm_vgem.mutex);
++   return 0;
++}
++
++void
++panvk_jm_vgem_worker_init(struct panvk_device *dev)
++{
++   const char *enabled = os_get_option("PANVK_KBASE_JM_VGEM_FENCE");
++   if (!enabled || enabled[0] != '1')
++      return;
++
++   const char *node = jm_vgem_node();
++   int fd = open(node, O_RDWR | O_CLOEXEC | O_NOCTTY);
++   if (fd < 0) {
++      mesa_logw("vgem fence: cannot open %s: %s", node, strerror(errno));
++      return;
 +   }
 +
-+   close(job->drm_fd);
-+   free(job);
-+   return 0;
++   if (!jm_vgem_is_render_node(fd)) {
++      mesa_logw("vgem fence: %s is not a vgem render node", node);
++      close(fd);
++      return;
++   }
++
++   if (mtx_init(&dev->jm_vgem.mutex, mtx_plain) != thrd_success) {
++      close(fd);
++      return;
++   }
++
++   if (cnd_init(&dev->jm_vgem.cond) != thrd_success) {
++      mtx_destroy(&dev->jm_vgem.mutex);
++      close(fd);
++      return;
++   }
++
++   dev->jm_vgem.vgem_fd = fd;
++   if (thrd_create(&dev->jm_vgem.thread, jm_vgem_worker_thread, dev) !=
++       thrd_success) {
++      mesa_logw("vgem fence: worker create failed");
++      dev->jm_vgem.vgem_fd = -1;
++      cnd_destroy(&dev->jm_vgem.cond);
++      mtx_destroy(&dev->jm_vgem.mutex);
++      close(fd);
++      return;
++   }
++
++   dev->jm_vgem.started = true;
++}
++
++void
++panvk_jm_vgem_worker_finish(struct panvk_device *dev)
++{
++   if (!dev->jm_vgem.started)
++      return;
++
++   mtx_lock(&dev->jm_vgem.mutex);
++   dev->jm_vgem.stopping = true;
++   cnd_broadcast(&dev->jm_vgem.cond);
++   mtx_unlock(&dev->jm_vgem.mutex);
++
++   thrd_join(dev->jm_vgem.thread, NULL);
++
++   int fd = dev->jm_vgem.vgem_fd;
++   cnd_destroy(&dev->jm_vgem.cond);
++   mtx_destroy(&dev->jm_vgem.mutex);
++   memset(&dev->jm_vgem, 0, sizeof(dev->jm_vgem));
++   if (fd >= 0)
++      close(fd);
 +}
 +
 +static VkResult
@@ -82,69 +271,63 @@ index b7900760273..1b967ed9bc1 100644
 +                                        struct vk_sync *sync,
 +                                        int *sync_file)
 +{
-+   const char *enabled = os_get_option("PANVK_KBASE_JM_VGEM_FENCE");
-+   if (!enabled || enabled[0] != '1')
-+      return kbase_cpu_sync_export_sync_file_jm(device, sync, sync_file);
++   struct panvk_device *dev = to_panvk_device(device);
++   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
 +
-+   const char *node = os_get_option("PANVK_KBASE_DRM_NODE");
-+   if (!node || !node[0] || !strcmp(node, "0"))
-+      node = "/dev/dri/renderD128";
-+
-+   int vgem_fd = open(node, O_RDWR | O_CLOEXEC | O_NOCTTY);
-+   if (vgem_fd < 0)
++   if (!dev->jm_vgem.started)
 +      return kbase_cpu_sync_export_sync_file_jm(device, sync, sync_file);
 +
 +   struct drm_vgem_fence_export_sync_file export = {0};
-+   if (drmIoctl(vgem_fd, DRM_IOCTL_VGEM_FENCE_EXPORT_SYNC_FILE, &export) < 0 ||
-+       export.fd < 0) {
-+      close(vgem_fd);
++   mtx_lock(&dev->jm_vgem.mutex);
++   int ret = drmIoctl(dev->jm_vgem.vgem_fd,
++                      DRM_IOCTL_VGEM_FENCE_EXPORT_SYNC_FILE, &export);
++   mtx_unlock(&dev->jm_vgem.mutex);
++   if (ret < 0 || export.fd < 0) {
++      mesa_logw("vgem fence export failed: %s", strerror(errno));
 +      return kbase_cpu_sync_export_sync_file_jm(device, sync, sync_file);
 +   }
 +
-+   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
-+   struct jm_vgem_signal_job *job = calloc(1, sizeof(*job));
-+   if (!job) {
-+      jm_vgem_signal_now(vgem_fd, export.out_fence);
-+      close(export.fd);
-+      close(vgem_fd);
-+      return kbase_cpu_sync_export_sync_file_jm(device, sync, sync_file);
-+   }
-+
-+   job->drm_fd = vgem_fd;
-+   job->fence = export.out_fence;
-+   job->timeout_ns = os_time_get_nano() + 25000000000ULL;
++   struct jm_vgem_signal_job job = {
++      .dev = dev,
++      .fence = export.out_fence,
++      .timeout_ns = os_time_get_nano() + 25000000000ULL,
++   };
 +
 +   mtx_lock(&ks->mutex);
 +   if (ks->state != KBASE_CPU_SYNC_SIGNALED) {
-+      job->wait = ks->pending_wait;
-+      job->data = ks->pending_data;
-+      memcpy(job->targets, ks->targets, sizeof(job->targets));
++      job.wait = ks->pending_wait;
++      job.data = ks->pending_data;
++      memcpy(job.targets, ks->targets, sizeof(job.targets));
++
++      if (job.wait == kbase_sync_file_wait_func && job.data) {
++         struct kbase_sync_file_waiter *src = job.data;
++         int fd = src->fd >= 0 ? dup(src->fd) : -1;
++         if (fd < 0) {
++            job.wait = NULL;
++            job.data = NULL;
++         } else {
++            job.wait = jm_vgem_fd_wait_func;
++            job.wait_fd = fd;
++            job.has_wait_fd = true;
++            job.data = NULL;
++         }
++      }
 +   }
 +   mtx_unlock(&ks->mutex);
 +
-+   if (job->wait == kbase_sync_file_wait_func && job->data) {
-+      struct kbase_sync_file_waiter *src = job->data;
-+      struct kbase_sync_file_waiter *copy = malloc(sizeof(*copy));
-+      if (!copy || src->fd < 0 || (copy->fd = dup(src->fd)) < 0) {
-+         free(copy);
-+         job->wait = NULL;
-+         job->data = NULL;
-+      } else {
-+         job->data = copy;
-+      }
-+   }
-+
-+   if (job->wait) {
-+      thrd_t thread;
-+      if (thrd_create(&thread, jm_vgem_signal_thread, job) != thrd_success) {
-+         job->wait = NULL;
-+         jm_vgem_signal_thread(job);
-+         close(export.fd);
-+         return kbase_cpu_sync_export_sync_file_jm(device, sync, sync_file);
-+      }
-+      thrd_detach(thread);
++   mtx_lock(&dev->jm_vgem.mutex);
++   if (!dev->jm_vgem.stopping &&
++       dev->jm_vgem.queued < PANVK_JM_VGEM_WORKER_QUEUE_SIZE) {
++      uint32_t tail = dev->jm_vgem.tail;
++      dev->jm_vgem.jobs[tail] = job;
++      dev->jm_vgem.tail =
++         (tail + 1) % PANVK_JM_VGEM_WORKER_QUEUE_SIZE;
++      dev->jm_vgem.queued++;
++      cnd_signal(&dev->jm_vgem.cond);
++      mtx_unlock(&dev->jm_vgem.mutex);
 +   } else {
-+      jm_vgem_signal_thread(job);
++      mtx_unlock(&dev->jm_vgem.mutex);
++      jm_vgem_run_job(dev, &job);
 +   }
 +
 +   *sync_file = export.fd;
@@ -154,7 +337,7 @@ index b7900760273..1b967ed9bc1 100644
  static const struct vk_sync_type kbase_cpu_sync_type = {
     .size      = sizeof(struct kbase_cpu_sync),
     .features  = VK_SYNC_FEATURE_BINARY |
-@@ -1274,7 +1412,7 @@ get_device_sync_types_kbase(struct panvk_physical_device *device,
+@@ -1274,7 +1532,7 @@ get_device_sync_types_kbase(struct panvk_physical_device *device,
  
     device->drm_syncobj_type = kbase_cpu_sync_type;
     if (pan_arch(device->kmod.dev->props.gpu_id) < 10)
@@ -163,3 +346,38 @@ index b7900760273..1b967ed9bc1 100644
  
     /* Binary CPU sync first (fences need a binary type with CPU_RESET),
      * software timeline emulation second (timeline semaphores).  Submitted
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index 468659b6314..b0dbe589ec4 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -794,6 +794,10 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+       goto err_finish_dev;
+    }
+ 
++#ifdef HAVE_PAN_KMOD_KBASE
++   panvk_jm_vgem_worker_init(device);
++#endif
++
+    if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC) || PANVK_DEBUG(DUMP) || PANVK_DEBUG(KBASE_DIAG)) {
+       device->debug.decode_ctx = pandecode_create_context(false);
+       pandecode_set_disassemble(device->debug.decode_ctx, pan_disassemble);
+@@ -1254,6 +1258,9 @@ err_destroy_kdev:
+    if (device->debug.decode_ctx)
+       pandecode_destroy_context(device->debug.decode_ctx);
+ 
++#ifdef HAVE_PAN_KMOD_KBASE
++   panvk_jm_vgem_worker_finish(device);
++#endif
+    pan_kmod_dev_destroy(device->kmod.dev);
+ 
+ err_finish_dev:
+@@ -1325,6 +1332,9 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
+    if (device->debug.decode_ctx)
+       pandecode_destroy_context(device->debug.decode_ctx);
+ 
++#ifdef HAVE_PAN_KMOD_KBASE
++   panvk_jm_vgem_worker_finish(device);
++#endif
+    pan_kmod_dev_destroy(device->kmod.dev);
+    vk_device_finish(&device->vk);
+    vk_free(&device->vk.alloc, device);

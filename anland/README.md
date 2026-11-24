@@ -16,6 +16,9 @@ plus two local patches for Samsung Galaxy A13 / Mali-G52 (Bifrost JM, arch v7).
   bridge for JM. Requires `anZxKr/SM-A135F_Kernel@77be591ee`. With
   `PANVK_KBASE_JM_VGEM_FENCE=1`, export returns a pending vgem fd immediately
   and signals it after kbase/JM completion. Default/off keeps the 0001 path.
+  The bridge uses one device-owned worker and a bounded job ring instead of a
+  thread and allocation per submit, validates the configured node as a vgem
+  render node, and reports wait/signal failures.
 - `anland/linux-aarch64-cross.ini` — AArch64 glibc cross file (system cross
   toolchain; no NEURAX sysroot needed).
 - `anland/build-g52.sh` — reproducible build driver.
