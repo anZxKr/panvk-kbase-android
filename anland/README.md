@@ -19,6 +19,11 @@ plus two local patches for Samsung Galaxy A13 / Mali-G52 (Bifrost JM, arch v7).
   The bridge uses one device-owned worker and a bounded job ring instead of a
   thread and allocation per submit, validates the configured node as a vgem
   render node, and reports wait/signal failures.
+- `anland/0003-panvk-jm-native-sync-file.patch` — native kbase JM `sync_file`
+  export via `BASE_JD_REQ_SOFT_FENCE_TRIGGER` and `BASE_JD_REQ_SOFT_FENCE_WAIT`.
+  With `PANVK_KBASE_JM_NATIVE_FENCE=1`, only this path is used. The vgem worker
+  is not started even if `PANVK_KBASE_JM_VGEM_FENCE=1`. Default/off keeps the
+  previous 0002/0001 selection.
 - `anland/linux-aarch64-cross.ini` — AArch64 glibc cross file (system cross
   toolchain; no NEURAX sysroot needed).
 - `anland/build-g52.sh` — reproducible build driver.
@@ -37,22 +42,27 @@ Host packages: `meson`, `ninja`, `aarch64-linux-gnu-{gcc,g++,ar,strip}`,
 `wayland-scanner`, `pkg-config`, aarch64 glibc headers/libs.
 
 Host tools (`mesa_clc`, `panfrost_compile`, `vtn_bindgen2`) are needed for
-`-Dmesa-clc=system -Dprecomp-compiler=system`. Build them with
-`scripts/bootstrap-host-tools.sh` or reuse a previously built `build/host-tools`.
+`-Dmesa-clc=system -Dprecomp-compiler=system`. Build them with:
+
+```sh
+PANVK_BUILD_ROOT=/home/ubuntu/panvk-driver-builds/jmnative
+scripts/bootstrap-host-tools.sh --mesa "$PANVK_BUILD_ROOT/mesa" --out "$PANVK_BUILD_ROOT/host-tools"
+```
 
 ```sh
 chmod +x anland/build-g52.sh
 PANVK_JOBS=2 ./anland/build-g52.sh
 
 chmod +x anland/build-g52-vgem-fence.sh
-PANVK_JOBS=2 ./anland/build-g52-vgem-fence.sh
+PANVK_BUILD_ROOT=/home/ubuntu/panvk-driver-builds/jmnative PANVK_JOBS=2 ./anland/build-g52-vgem-fence.sh
 ```
 
 Outputs:
 
 ```text
-artifacts/panvk-g52-anland/libvulkan_panfrost.so
-artifacts/panvk-g52-vgem-fence/libvulkan_panfrost.so
+/home/ubuntu/panvk-driver-builds/jmnative/out/libvulkan_panfrost.so
+/home/ubuntu/panvk-driver-builds/jmnative/out/panvk-g52.json
+/home/ubuntu/panvk-driver-builds/jmnative/out/SHA256SUMS
 ```
 
 ## Device install (container, Fedora 45 aarch64)
@@ -81,4 +91,14 @@ PANVK_KBASE_ANLAND_STAGING=1
 PANVK_KBASE_JM_VGEM_FENCE=1
 ```
 
-The rebuilt `vgem.ko` must be loaded manually after boot.
+niri env for the native JM fence ICD:
+
+```
+ANLAND_PANVK_ICD=/opt/panvk-anland/libvulkan_panfrost.so
+VK_DRIVER_FILES=/opt/panvk-anland/panvk-g52.json
+PANVK_KBASE_DRM_NODE=/dev/dri/renderD128
+PANVK_KBASE_ANLAND_STAGING=1
+PANVK_KBASE_JM_NATIVE_FENCE=1
+```
+
+The rebuilt `vgem.ko` must be loaded manually after boot for the vgem path only.

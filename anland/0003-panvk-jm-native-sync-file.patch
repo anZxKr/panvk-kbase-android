@@ -1,0 +1,283 @@
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index cbc7a574e96..8afd3e65cc7 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -132,6 +132,10 @@ struct base_jd_atom {
+    __u8 padding[15];
+ };
+ 
++#define BASE_JD_REQ_SOFT_JOB                 ((uint32_t)1 << 9)
++#define BASE_JD_REQ_SOFT_FENCE_TRIGGER       (BASE_JD_REQ_SOFT_JOB | 0x2)
++#define BASE_JD_REQ_SOFT_FENCE_WAIT          (BASE_JD_REQ_SOFT_JOB | 0x3)
++
+ /* JM-only memory flag (mali_base_jm_kernel.h); CSF reserves bit 20. */
+ #define KBASE_JM_MEM_TILER_ALIGN_TOP ((uint64_t)1 << 20)
+ 
+@@ -3919,6 +3923,130 @@ kbase_kmod_job_submit_dep(struct pan_kmod_dev *dev, uint64_t jc,
+    return atom.atom_number;
+ }
+ 
++static uint64_t
++kbase_jm_soft_submit(struct pan_kmod_dev *dev, uint32_t core_req,
++                     uintptr_t jc, uint64_t dep0, uint64_t dep1)
++{
++   struct kbase_kmod_dev *kd = container_of(dev, struct kbase_kmod_dev, base);
++   if (kd->is_csf) {
++      errno = ENOTSUP;
++      return 0;
++   }
++
++   struct kbase_atom_slot *slot =
++      kbase_atom_alloc(kd, NULL, 0, core_req, true);
++   if (!slot)
++      return 0;
++
++   struct base_jd_atom atom = {
++      .jc = (uint64_t)jc,
++      .core_req = core_req,
++      .atom_number = (uint8_t)slot->atom_number,
++   };
++   uint64_t deps[2] = { dep0, dep1 };
++   for (unsigned i = 0; i < 2; i++) {
++      bool use = deps[i] && deps[i] != atom.atom_number;
++      atom.pre_dep[i].atom_id = use ? (uint8_t)deps[i] : 0;
++      atom.pre_dep[i].dependency_type = use ? BASE_JD_DEP_TYPE_ORDER : 0;
++   }
++
++   struct {
++      __u64 seq_nr;
++      struct base_jd_atom atom;
++   } w = { .atom = atom };
++   struct kbase_ioctl_job_submit sub = {
++      .addr = kd->atom_seq_nr ? (uintptr_t)&w : (uintptr_t)&atom,
++      .nr_atoms = 1,
++      .stride = kd->atom_stride,
++   };
++   if (ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &sub) < 0) {
++      mesa_loge("kbase: JOB_SUBMIT(soft fence) failed: %s", strerror(errno));
++      simple_mtx_lock(&kd->atoms_lock);
++      slot->atom_number = 0;
++      simple_mtx_unlock(&kd->atoms_lock);
++      return 0;
++   }
++   return atom.atom_number;
++}
++
++static uint64_t
++kbase_jm_fence_trigger(struct pan_kmod_dev *dev, uint64_t dep0, uint64_t dep1,
++                       int *out_fd)
++{
++   struct base_fence fence = {
++      .basep = {
++         .fd = -1,
++         .stream_fd = -1,
++      },
++   };
++   uint64_t atom = kbase_jm_soft_submit(dev, BASE_JD_REQ_SOFT_FENCE_TRIGGER,
++                                        (uintptr_t)&fence, dep0, dep1);
++   if (!atom)
++      return 0;
++   if (fence.basep.fd < 0) {
++      errno = ENODEV;
++      return 0;
++   }
++   *out_fd = fence.basep.fd;
++   return atom;
++}
++
++int
++kbase_kmod_jm_fence_wait(struct pan_kmod_dev *dev, int fd)
++{
++   struct base_fence fence = {
++      .basep = {
++         .fd = fd,
++         .stream_fd = -1,
++      },
++   };
++   uint64_t atom = kbase_jm_soft_submit(dev, BASE_JD_REQ_SOFT_FENCE_WAIT,
++                                        (uintptr_t)&fence, 0, 0);
++   if (!atom)
++      return errno ? -errno : -EINVAL;
++   return (int)atom;
++}
++
++int
++kbase_kmod_jm_fence_export(struct pan_kmod_dev *dev,
++                           const uint64_t deps[KBASE_KMOD_JM_FENCE_MAX_DEPS],
++                           int *out_fd)
++{
++   uint64_t chain[KBASE_KMOD_JM_FENCE_MAX_DEPS] = { 0 };
++   unsigned n = 0;
++
++   for (unsigned i = 0; i < KBASE_KMOD_JM_FENCE_MAX_DEPS; i++) {
++      if (!deps[i])
++         continue;
++      if (n == ARRAY_SIZE(chain)) {
++         errno = EINVAL;
++         return -EINVAL;
++      }
++      chain[n++] = deps[i];
++   }
++
++   while (n > 2) {
++      int tmp_fd = -1;
++      uint64_t atom = kbase_jm_fence_trigger(dev, chain[0], chain[1], &tmp_fd);
++      if (!atom)
++         return errno ? -errno : -EINVAL;
++      close(tmp_fd);
++
++      unsigned remaining = n - 2;
++      memmove(chain, chain + 2, remaining * sizeof(chain[0]));
++      chain[remaining] = atom;
++      n = remaining + 1;
++   }
++
++   int fd = -1;
++   uint64_t atom = kbase_jm_fence_trigger(dev, n > 0 ? chain[0] : 0,
++                                          n > 1 ? chain[1] : 0, &fd);
++   if (!atom)
++      return errno ? -errno : -EINVAL;
++   *out_fd = fd;
++   return 0;
++}
++
+ void
+ kbase_kmod_atom_release(struct pan_kmod_dev *dev, uint64_t atom_num)
+ {
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.h b/src/panfrost/lib/kmod/kbase_kmod.h
+index 1782cf944da..d3299e81d36 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.h
++++ b/src/panfrost/lib/kmod/kbase_kmod.h
+@@ -34,6 +34,13 @@ struct base_external_resource {
+ #define BASE_JD_REQ_EXTERNAL_RESOURCES (1u << 8)
+ #define BASE_JD_REQ_ONLY_COMPUTE       (1u << 10)
+ 
++#define KBASE_KMOD_JM_FENCE_MAX_DEPS 4
++
++int kbase_kmod_jm_fence_wait(struct pan_kmod_dev *dev, int fd);
++int kbase_kmod_jm_fence_export(struct pan_kmod_dev *dev,
++                               const uint64_t deps[KBASE_KMOD_JM_FENCE_MAX_DEPS],
++                               int *out_fd);
++
+ uint64_t kbase_kmod_job_submit(struct pan_kmod_dev *dev, uint64_t jc,
+                               uint32_t core_req, struct pan_kmod_bo **bos,
+                               uint32_t nbo,
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index ab18eca1769..32451783ab9 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -50,6 +50,7 @@
+ #include "pan_afbc.h"
+ #include "pan_compiler.h"
+ #include "pan_props.h"
++#include "kmod/kbase_kmod.h"
+ 
+ #if defined(HAVE_PAN_KMOD_KBASE)
+ #define DRM_VGEM_FENCE_EXPORT_SYNC_FILE 0x3
+@@ -1368,6 +1369,10 @@ jm_vgem_worker_thread(void *arg)
+ void
+ panvk_jm_vgem_worker_init(struct panvk_device *dev)
+ {
++   const char *native = os_get_option("PANVK_KBASE_JM_NATIVE_FENCE");
++   if (native && native[0] == '1')
++      return;
++
+    const char *enabled = os_get_option("PANVK_KBASE_JM_VGEM_FENCE");
+    if (!enabled || enabled[0] != '1')
+       return;
+@@ -1499,6 +1504,86 @@ kbase_cpu_sync_export_sync_file_jm_vgem(struct vk_device *device,
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++kbase_cpu_sync_export_sync_file_jm_native(struct vk_device *device,
++                                          struct vk_sync *sync,
++                                          int *sync_file)
++{
++   struct panvk_device *dev = to_panvk_device(device);
++   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
++   uint64_t deps[KBASE_KMOD_JM_FENCE_MAX_DEPS] = { 0 };
++   unsigned n = 0;
++   int wait_fd = -1;
++   bool supported = false;
++
++   mtx_lock(&ks->mutex);
++   if (ks->state == KBASE_CPU_SYNC_SIGNALED) {
++      supported = true;
++   } else if (ks->state == KBASE_CPU_SYNC_FAILED) {
++      VkResult result = ks->result;
++      mtx_unlock(&ks->mutex);
++      return result;
++   } else {
++      for (unsigned i = 0; i < PANVK_KBASE_SYNC_TARGET_COUNT; i++) {
++         if (!ks->targets[i])
++            continue;
++         if (n >= ARRAY_SIZE(deps))
++            break;
++         deps[n++] = ks->targets[i];
++      }
++
++      if (ks->pending_wait == kbase_sync_file_wait_func && ks->pending_data) {
++         struct kbase_sync_file_waiter *waiter = ks->pending_data;
++         if (waiter->fd >= 0)
++            wait_fd = dup(waiter->fd);
++      }
++
++      supported = n > 0 || wait_fd >= 0;
++   }
++   mtx_unlock(&ks->mutex);
++
++   if (!supported) {
++      if (wait_fd >= 0)
++         close(wait_fd);
++      return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
++                       "native fence export has no atom or sync_file payload");
++   }
++
++   if (wait_fd >= 0) {
++      int atom = kbase_kmod_jm_fence_wait(dev->kmod.dev, wait_fd);
++      close(wait_fd);
++      if (atom < 0)
++         return vk_errorf(device, VK_ERROR_DEVICE_LOST,
++                          "native fence wait submit failed: %s",
++                          strerror(-atom));
++      if (n >= ARRAY_SIZE(deps))
++         return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
++                          "native fence dependency overflow");
++      deps[n++] = atom;
++   }
++
++   int fd = -1;
++   int ret = kbase_kmod_jm_fence_export(dev->kmod.dev, deps, &fd);
++   if (ret < 0)
++      return vk_errorf(device, VK_ERROR_DEVICE_LOST,
++                       "native fence export failed: %s", strerror(-ret));
++
++   *sync_file = fd;
++   return VK_SUCCESS;
++}
++
++static VkResult
++kbase_cpu_sync_export_sync_file_jm_select(struct vk_device *device,
++                                          struct vk_sync *sync,
++                                          int *sync_file)
++{
++   const char *native = os_get_option("PANVK_KBASE_JM_NATIVE_FENCE");
++   if (native && native[0] == '1')
++      return kbase_cpu_sync_export_sync_file_jm_native(device, sync, sync_file);
++
++   return kbase_cpu_sync_export_sync_file_jm_vgem(device, sync, sync_file);
++}
++
+ static const struct vk_sync_type kbase_cpu_sync_type = {
+    .size      = sizeof(struct kbase_cpu_sync),
+    .features  = VK_SYNC_FEATURE_BINARY |
+@@ -1532,7 +1617,7 @@ get_device_sync_types_kbase(struct panvk_physical_device *device,
+ 
+    device->drm_syncobj_type = kbase_cpu_sync_type;
+    if (pan_arch(device->kmod.dev->props.gpu_id) < 10)
+-      device->drm_syncobj_type.export_sync_file = kbase_cpu_sync_export_sync_file_jm_vgem;
++      device->drm_syncobj_type.export_sync_file = kbase_cpu_sync_export_sync_file_jm_select;
+ 
+    /* Binary CPU sync first (fences need a binary type with CPU_RESET),
+     * software timeline emulation second (timeline semaphores).  Submitted
