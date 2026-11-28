@@ -41,7 +41,7 @@ index cbc7a574e96..8afd3e65cc7 100644
 +   for (unsigned i = 0; i < 2; i++) {
 +      bool use = deps[i] && deps[i] != atom.atom_number;
 +      atom.pre_dep[i].atom_id = use ? (uint8_t)deps[i] : 0;
-+      atom.pre_dep[i].dependency_type = use ? BASE_JD_DEP_TYPE_ORDER : 0;
++      atom.pre_dep[i].dependency_type = use ? BASE_JD_DEP_TYPE_DATA : 0;
 +   }
 +
 +   struct {
@@ -223,7 +223,7 @@ index ab18eca1769..32451783ab9 100644
 +            wait_fd = dup(waiter->fd);
 +      }
 +
-+      supported = n > 0 || wait_fd >= 0;
++      supported = ks->pending_wait == kbase_sync_file_wait_func ? wait_fd >= 0 : ks->state != KBASE_CPU_SYNC_RESET;
 +   }
 +   mtx_unlock(&ks->mutex);
 +
